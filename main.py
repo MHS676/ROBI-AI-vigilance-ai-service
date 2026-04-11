@@ -40,6 +40,10 @@ from schemas import (
     AnomalyType,
     AnalyzeFrameRequest,
     AnalyzeFrameResponse,
+    CameraConfigUpdate,
+    CameraConfigResponse,
+    AiFeature,
+    CLASS_TO_FEATURE,
     Detection,
 )
 
@@ -50,6 +54,21 @@ settings = get_settings()
 # ─────────────────────────────────────────────────────────────────────────────
 
 model: BaseYoloModel | None = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-camera AI feature configuration (in-memory)
+#
+# Populated by POST /camera-config (called by NestJS when a Super Admin
+# toggles a feature on the Frontend).
+#
+# Structure: { camera_id: set_of_enabled_AiFeature_strings }
+# Default (key not present): ALL features are enabled.
+# ─────────────────────────────────────────────────────────────────────────────
+
+camera_configs: dict[str, set[str]] = {}
+
+# All feature values — used as the "all enabled" default
+_ALL_FEATURES: set[str] = {f.value for f in AiFeature}
 
 
 @asynccontextmanager
@@ -110,7 +129,59 @@ async def health() -> dict:
         "model": settings.model_path,
         "env": settings.app_env,
         "server_time": datetime.now(timezone.utc).isoformat(),
+        "configured_cameras": len(camera_configs),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /camera-config — Dynamic AI feature toggle (called by NestJS backend)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/camera-config",
+    response_model=CameraConfigResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Configuration"],
+    summary="Update enabled AI features for a specific camera",
+    description="""
+Called by the NestJS backend whenever a Super Admin toggles an AI feature
+on the Hardware Mapping page.
+
+Stores the enabled feature set in memory. On the **next** `/analyze-frame`
+call for this camera, only detections that belong to an enabled feature will
+be considered alert candidates.
+
+An empty `enabled_features` list disables all AI detection for that camera.
+Sending all five features re-enables everything.
+    """,
+)
+async def update_camera_config(request: CameraConfigUpdate) -> CameraConfigResponse:
+    camera_configs[request.camera_id] = {f.value for f in request.enabled_features}
+    logger.info(
+        f"⚙️  Camera config updated  camera={request.camera_id}  "
+        f"features={[f.value for f in request.enabled_features]}"
+    )
+    return CameraConfigResponse(
+        camera_id=request.camera_id,
+        enabled_features=request.enabled_features,
+        message=f"Config updated — {len(request.enabled_features)} feature(s) enabled",
+    )
+
+
+@app.get(
+    "/camera-config/{camera_id}",
+    response_model=CameraConfigResponse,
+    tags=["Configuration"],
+    summary="Get current AI feature config for a camera",
+)
+async def get_camera_config(camera_id: str) -> CameraConfigResponse:
+    enabled_set = camera_configs.get(camera_id, _ALL_FEATURES)
+    features = [AiFeature(f) for f in enabled_set if f in _ALL_FEATURES]
+    return CameraConfigResponse(
+        camera_id=camera_id,
+        enabled_features=features,
+        message="default (all enabled)" if camera_id not in camera_configs else "custom config",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,11 +265,25 @@ async def analyze_frame(
 
     # ── 4. Anomaly detection ──────────────────────────────────────────────────
     alert_class_set = settings.alert_class_set
+
+    # Per-camera enabled feature gate:
+    # If the camera has a custom config, only consider detections whose class
+    # maps to an enabled AiFeature. Default (no config): all features allowed.
+    enabled_features: set[str] = camera_configs.get(request.camera_id, _ALL_FEATURES)
+
     anomaly_detection: Detection | None = None
 
     # Only anomalies INSIDE the table's ROI trigger an alert
     for det in roi_detections:
         if det.class_name.lower() in alert_class_set:
+            # Check if the feature gate allows this class
+            required_feature = CLASS_TO_FEATURE.get(det.class_name.lower())
+            if required_feature and required_feature.value not in enabled_features:
+                logger.debug(
+                    f"🔇 Skipping {det.class_name} — feature "
+                    f"{required_feature.value} disabled for camera {request.camera_id}"
+                )
+                continue
             # Pick the highest-confidence alert-class detection
             if anomaly_detection is None or det.confidence > anomaly_detection.confidence:
                 anomaly_detection = det

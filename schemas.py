@@ -206,3 +206,48 @@ class AlertPayload(BaseModel):
     detections: list[dict[str, Any]]
     timestamp: float
     source: str = "ai-service"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic AI Configuration — per-camera feature toggles
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AiFeature(str, Enum):
+    """AI inference features that can be individually enabled/disabled per camera."""
+    WEAPON = "WEAPON"  # knife, gun, pistol, rifle, weapon
+    FIGHT  = "FIGHT"   # physical altercation / aggression
+    FALL   = "FALL"    # person-fall detection
+    FIRE   = "FIRE"    # fire and smoke
+    CROWD  = "CROWD"   # crowd density / overcrowding
+
+
+# Mapping: YOLO class name → AiFeature gate
+CLASS_TO_FEATURE: dict[str, AiFeature] = {
+    "knife":        AiFeature.WEAPON,
+    "gun":          AiFeature.WEAPON,
+    "pistol":       AiFeature.WEAPON,
+    "rifle":        AiFeature.WEAPON,
+    "weapon":       AiFeature.WEAPON,
+    "fight":        AiFeature.FIGHT,
+    "fall":         AiFeature.FALL,
+    "fire":         AiFeature.FIRE,
+    "smoke":        AiFeature.FIRE,
+    "crowd":        AiFeature.CROWD,
+    "overcrowding": AiFeature.CROWD,
+}
+
+
+class CameraConfigUpdate(BaseModel):
+    """Payload accepted by POST /camera-config."""
+    camera_id: str = Field(..., description="CUID of the camera to configure")
+    enabled_features: list[AiFeature] = Field(
+        default_factory=list,
+        description="List of enabled AI features. Empty list → all features disabled.",
+    )
+
+
+class CameraConfigResponse(BaseModel):
+    """Response from POST /camera-config."""
+    camera_id: str
+    enabled_features: list[AiFeature]
+    message: str
