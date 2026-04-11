@@ -1,0 +1,32 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Falcon Security — AI Microservice  (Python 3.11+)
+# Edge Worker: frame analysis, YOLOv8 inference, anomaly alerting
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# HTTP client (sends alerts back to the NestJS API)
+httpx==0.28.1
+
+# Image handling
+Pillow==11.1.0
+numpy==2.2.1
+
+# Data validation (FastAPI uses this natively)
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# YOLOv8 inference — ultralytics bundles the model + torchvision
+# Comment this out and use the mock if running without a GPU / large deps
+# ultralytics==8.3.50
+
+# Async task queue (used for non-blocking alert dispatch)
+# No external broker needed — uses asyncio internally via BackgroundTasks
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Logging
+loguru==0.7.3

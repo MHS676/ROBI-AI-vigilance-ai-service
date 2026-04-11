@@ -1,0 +1,17 @@
+# Environment variables — NEVER commit
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.pt
+*.onnx
+runs/
