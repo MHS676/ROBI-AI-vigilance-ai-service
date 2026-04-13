@@ -131,12 +131,13 @@ class AlertSeverity(str, Enum):
 
 
 class AnomalyType(str, Enum):
-    WEAPON_DETECTED = "WEAPON_DETECTED"
-    FIGHT_DETECTED = "FIGHT_DETECTED"
-    FALL_DETECTED = "FALL_DETECTED"
-    FIRE_DETECTED = "FIRE_DETECTED"
+    WEAPON_DETECTED  = "WEAPON_DETECTED"
+    FIGHT_DETECTED   = "FIGHT_DETECTED"
+    FALL_DETECTED    = "FALL_DETECTED"
+    FIRE_DETECTED    = "FIRE_DETECTED"
     UNATTENDED_OBJECT = "UNATTENDED_OBJECT"
-    UNKNOWN = "UNKNOWN"
+    IRATE_CUSTOMER   = "IRATE_CUSTOMER"   # Objective 13 — cross-camera face emotion
+    UNKNOWN          = "UNKNOWN"
 
 
 class Detection(BaseModel):
@@ -251,3 +252,219 @@ class CameraConfigResponse(BaseModel):
     camera_id: str
     enabled_features: list[AiFeature]
     message: str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-Camera Face Emotion Analysis — Objective 13: Irate Customer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EmotionType(str, Enum):
+    """Emotion categories used for customer expression analysis."""
+    ANGRY      = "ANGRY"       # primary irate indicator
+    FRUSTRATED = "FRUSTRATED"  # secondary irate indicator
+    NEUTRAL    = "NEUTRAL"     # baseline expression
+    HAPPY      = "HAPPY"
+    CALM       = "CALM"
+    SURPRISED  = "SURPRISED"
+    DISGUSTED  = "DISGUSTED"   # tertiary irate indicator
+    FEARFUL    = "FEARFUL"
+
+
+#: Emotion values that contribute to the IRATE_CUSTOMER classification
+IRATE_EMOTIONS: frozenset[str] = frozenset({
+    EmotionType.ANGRY,
+    EmotionType.FRUSTRATED,
+    EmotionType.DISGUSTED,
+})
+
+#: Minimum irate-emotion score (0–1) required to fire an IRATE_CUSTOMER alert
+IRATE_EMOTION_THRESHOLD: float = 0.65
+
+
+class FaceDetection(BaseModel):
+    """
+    A single face detected inside a camera frame, with emotion analysis.
+    Produced by BaseFaceAnalyzer.analyze() and consumed by BestViewSelector.
+    """
+    face_id: int = Field(..., description="Index of this face within the frame (0-based)")
+    bounding_box: BoundingBox
+    detection_confidence: float = Field(..., ge=0.0, le=1.0)
+
+    # Per-emotion probability scores (keys match EmotionType values)
+    emotion_scores: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-emotion probability scores (0–1). Keys are EmotionType enum values.",
+    )
+    dominant_emotion: EmotionType = Field(
+        default=EmotionType.NEUTRAL,
+        description="Highest-scoring emotion for this face",
+    )
+
+    # ── Clarity metrics — drive the Best View Selector ────────────────────────
+    face_area_px: int = Field(
+        ...,
+        description="Face bounding-box area in pixels (width × height)",
+    )
+    sharpness_score: float = Field(
+        ..., ge=0.0, le=1.0,
+        description=(
+            "Image sharpness estimate (0–1). "
+            "Real mode: normalised Laplacian variance. Mock: simulated."
+        ),
+    )
+    clarity_score: float = Field(
+        ..., ge=0.0, le=1.0,
+        description=(
+            "Composite clarity score (0–1) combining face_area, sharpness, and "
+            "detection_confidence. Higher = cleaner view. Used by BestViewSelector."
+        ),
+    )
+    is_inside_roi: bool   = Field(default=False)
+    roi_overlap: float    = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class DeskRoi(BaseModel):
+    """Region of Interest covering one service desk on a given camera’s frame."""
+    desk_id:     str            = Field(..., description="Stable desk ID, e.g. 'desk_1'")
+    desk_label:  str            = Field(..., description="Human-readable name, e.g. 'Desk 1 — Teller A'")
+    table_id:    str | None     = Field(None, description="CUID of the linked DB Table (once provisioned)")
+    bounding_box: BoundingBox
+
+
+class CameraRoiLayout(BaseModel):
+    """All desk ROIs registered for one physical camera."""
+    camera_id: str
+    desk_rois: list[DeskRoi] = Field(default_factory=list)
+
+    def get_roi_for_desk(self, desk_id: str) -> "DeskRoi | None":
+        """Return the DeskRoi for the given desk_id, or None."""
+        for roi in self.desk_rois:
+            if roi.desk_id == desk_id:
+                return roi
+        return None
+
+    @property
+    def desk_ids(self) -> list[str]:
+        return [r.desk_id for r in self.desk_rois]
+
+
+class CrossCameraLayout(BaseModel):
+    """
+    A named multi-camera layout for a branch.
+
+    Maps two or more cameras to the same set of service desks viewed from
+    different physical angles. The primary_camera_id is the frontal / highest-
+    resolution camera; secondary cameras provide face-angle coverage.
+    """
+    layout_id:         str                = Field(..., description="Unique ID, e.g. 'layout_cam1_cam2'")
+    description:       str                = Field(default="")
+    primary_camera_id: str                = Field(..., description="Frontal / highest-resolution camera ID")
+    cameras:           list[CameraRoiLayout] = Field(
+        ..., description="Per-camera desk ROI mappings. At least one camera required."
+    )
+
+    @property
+    def all_desk_ids(self) -> list[str]:
+        """Sorted deduplicated list of all desk IDs across all cameras."""
+        ids: set[str] = set()
+        for cam in self.cameras:
+            ids.update(cam.desk_ids)
+        return sorted(ids)
+
+    def get_camera_layout(self, camera_id: str) -> "CameraRoiLayout | None":
+        for cam in self.cameras:
+            if cam.camera_id == camera_id:
+                return cam
+        return None
+
+
+class CrossCameraFrameInput(BaseModel):
+    """One camera’s frame contribution to a cross-camera analysis request."""
+    camera_id:    str
+    frame_base64: str
+    timestamp:    float | None = None
+
+    @field_validator("frame_base64")
+    @classmethod
+    def strip_data_uri(cls, v: str) -> str:
+        """Silently strip the data URI prefix if the client included it."""
+        if "," in v and v.startswith("data:"):
+            return v.split(",", 1)[1]
+        return v
+
+
+class CrossCameraAnalyzeRequest(BaseModel):
+    """POST /analyze-cross-camera — frames from all cameras in a named layout."""
+    center_id:  str
+    layout_id:  str = Field(
+        ...,
+        description=(
+            "ID of a registered CrossCameraLayout. "
+            "Use 'layout_cam1_cam2' for the built-in 3-desk layout."
+        ),
+    )
+    frames: list[CrossCameraFrameInput] = Field(
+        ..., min_length=1,
+        description="Frames from one or more cameras listed in the layout.",
+    )
+    timestamp: float | None = None
+
+
+class BestViewCandidate(BaseModel):
+    """One camera’s best face candidate for a given desk."""
+    camera_id:     str
+    desk_id:       str
+    face:          FaceDetection | None = Field(
+        None,
+        description="Best face found in this camera’s desk ROI (None = no face detected)",
+    )
+    clarity_score: float = Field(
+        default=0.0,
+        description="0.0 when no face detected; otherwise the best face’s clarity_score",
+    )
+
+
+class BestViewResult(BaseModel):
+    """
+    Cross-camera analysis result for one desk — Objective 13: Irate Customer.
+
+    The Best View Selector picks the camera with the highest-clarity face.
+    Emotion analysis (and the irate flag) come from that winning camera’s face.
+    """
+    desk_id:   str
+    desk_label: str
+    table_id:  str | None
+
+    # ── Best View Selection ─────────────────────────────────────────────────
+    winner_camera_id:    str   = Field(..., description="Camera that provided the best face view")
+    winner_clarity_score: float = Field(..., ge=0.0, le=1.0)
+    no_face_detected:    bool  = Field(default=False)
+
+    # ── Expression analysis (from the winning camera) ──────────────────────
+    dominant_emotion: EmotionType         = Field(default=EmotionType.NEUTRAL)
+    emotion_scores:   dict[str, float]    = Field(default_factory=dict)
+    irate_confidence: float               = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description=(
+            "max(ANGRY, FRUSTRATED, DISGUSTED) from the winning face. "
+            "Triggers IRATE_CUSTOMER alert when ≥ IRATE_EMOTION_THRESHOLD (0.65)."
+        ),
+    )
+    is_irate: bool = Field(
+        default=False,
+        description="True if irate_confidence ≥ IRATE_EMOTION_THRESHOLD",
+    )
+
+    # ── All candidates (audit trail / frontend debug panel) ─────────────────
+    candidates: list[BestViewCandidate] = Field(default_factory=list)
+
+
+class CrossCameraAnalyzeResponse(BaseModel):
+    """Response from POST /analyze-cross-camera."""
+    center_id:               str
+    layout_id:               str
+    desk_results:            list[BestViewResult]
+    total_irate_detected:    int   = Field(default=0, description="Desks with irate customers")
+    irate_alerts_dispatched: int   = Field(default=0, description="Alerts POSTed to NestJS")
+    inference_ms:            float = Field(description="Total wall-clock inference time (ms)")
+    server_time:             str

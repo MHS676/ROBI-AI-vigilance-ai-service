@@ -162,3 +162,86 @@ async def dispatch_alert(
     except Exception as exc:  # noqa: BLE001
         logger.exception(f"❌ Unexpected error dispatching alert: {exc}")
         return False, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Irate Customer alert (cross-camera face emotion pipeline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def dispatch_face_alert(
+    center_id:        str,
+    camera_id:        str,
+    table_id:         str | None,
+    desk_id:          str,
+    dominant_emotion: str,
+    irate_confidence: float,
+) -> tuple[bool, int | None]:
+    """
+    POST an IRATE_CUSTOMER alert to the NestJS /ingest/ai-alert endpoint.
+
+    Called by POST /analyze-cross-camera as a BackgroundTask whenever the
+    BestViewSelector determines that irate_confidence >= IRATE_EMOTION_THRESHOLD
+    for a desk.
+
+    The ``detections`` list carries face-emotion metadata instead of YOLO boxes
+    so NestJS can enrich the WS event with emotion context for the dashboard.
+
+    Returns:
+        (dispatched: bool, http_status: int | None)
+    """
+    payload = AlertPayload(
+        center_id=center_id,
+        camera_id=camera_id,
+        table_id=table_id,
+        anomaly_type=AnomalyType.IRATE_CUSTOMER.value,
+        severity=AlertSeverity.HIGH.value,
+        primary_event=AnomalyType.IRATE_CUSTOMER.value,
+        detections=[
+            {
+                "source":           "cross-camera-face-analysis",
+                "desk_id":          desk_id,
+                "dominant_emotion": dominant_emotion,
+                "irate_confidence": round(irate_confidence, 4),
+            }
+        ],
+        timestamp=time.time(),
+    )
+
+    client = get_http_client()
+    url    = "/ingest/ai-alert"
+
+    try:
+        response = await client.post(url, json=payload.model_dump())
+        status   = response.status_code
+
+        if response.is_success:
+            logger.success(
+                f"✅ IRATE_CUSTOMER alert dispatched → NestJS [{status}]  "
+                f"center={center_id}  desk={desk_id}  "
+                f"emotion={dominant_emotion}  conf={irate_confidence:.2f}"
+            )
+        else:
+            logger.warning(
+                f"⚠️  IRATE_CUSTOMER dispatch returned {status} → NestJS {url}  "
+                f"center={center_id}  body={response.text[:200]}"
+            )
+
+        return True, status
+
+    except httpx.ConnectError:
+        logger.error(
+            f"❌ IRATE_CUSTOMER alert: cannot reach NestJS at "
+            f"{settings.nestjs_api_url}{url} — is the backend running?"
+        )
+        return False, None
+
+    except httpx.TimeoutException:
+        logger.error(
+            f"⏱️  IRATE_CUSTOMER alert timed out → NestJS {url}  "
+            f"center={center_id}  desk={desk_id}"
+        )
+        return False, None
+
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(f"❌ Unexpected error dispatching IRATE_CUSTOMER alert: {exc}")
+        return False, None

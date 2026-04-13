@@ -22,7 +22,17 @@ from PIL import Image
 from loguru import logger
 
 from config import get_settings
-from schemas import BoundingBox, Detection
+from schemas import (
+    BoundingBox,
+    Detection,
+    EmotionType,
+    FaceDetection,
+    DeskRoi,
+    BestViewCandidate,
+    BestViewResult,
+    IRATE_EMOTIONS,
+    IRATE_EMOTION_THRESHOLD,
+)
 
 settings = get_settings()
 
@@ -278,3 +288,376 @@ def filter_detections_by_roi(
         det.is_inside_roi = ratio >= min_overlap
 
     return detections
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Face Emotion Analyzer — Objective 13: Irate Customer
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Realistic emotion probability weights for a customer-service environment
+# (bank counter / telecom office). Mostly NEUTRAL; small tail of angry/irate.
+_EMOTION_WEIGHTS: dict[str, float] = {
+    EmotionType.NEUTRAL:    0.44,
+    EmotionType.HAPPY:      0.18,
+    EmotionType.FRUSTRATED: 0.15,
+    EmotionType.CALM:       0.09,
+    EmotionType.ANGRY:      0.07,
+    EmotionType.SURPRISED:  0.04,
+    EmotionType.DISGUSTED:  0.02,
+    EmotionType.FEARFUL:    0.01,
+}
+_EMOTION_KEYS:   list[str]   = list(_EMOTION_WEIGHTS.keys())
+_EMOTION_W_LIST: list[float] = list(_EMOTION_WEIGHTS.values())
+
+
+def _compute_clarity_score(
+    face_area_px: int,
+    sharpness_score: float,
+    detection_confidence: float,
+    frame_area_px: int,
+) -> float:
+    """
+    Composite face clarity score (0–1) used by BestViewSelector.
+
+    Weights
+    -------
+    50%  face area relative to frame — bigger face = better / closer view
+    30%  sharpness estimate (normalised Laplacian variance in real mode)
+    20%  face detection confidence
+
+    The area component is capped at 25% of the frame to prevent extreme values
+    when a face fills most of the camera's FOV.
+    """
+    area_ratio = min(1.0, face_area_px / max(1, frame_area_px * 0.25))
+    score = 0.50 * area_ratio + 0.30 * sharpness_score + 0.20 * detection_confidence
+    return round(score, 4)
+
+
+class BaseFaceAnalyzer(ABC):
+    """Common interface for face detection + emotion analysis engines."""
+
+    @abstractmethod
+    def analyze(self, image: Image.Image, roi: BoundingBox) -> list[FaceDetection]:
+        """
+        Detect faces within `roi` and return per-face emotion analysis.
+
+        Args:
+            image: Full camera frame (PIL RGB).
+            roi:   Desk bounding box — only faces overlapping this ROI matter.
+
+        Returns:
+            List of FaceDetection objects annotated with clarity metrics and
+            ROI membership flags.
+        """
+
+
+class MockFaceAnalyzer(BaseFaceAnalyzer):
+    """
+    Mock face analyzer for development and CI.
+
+    Behaviour
+    ---------
+    - Simulates 0–2 faces per ROI (weighted: 30% zero, 60% one, 10% two).
+    - Emotion scores are sampled with realistic customer-service weights.
+    - When ``MOCK_FORCE_ANOMALY=1`` is set, the first face in every ROI is
+      guaranteed ANGRY with irate_confidence ≥ 0.68 — always triggers an alert.
+    - Clarity score is computed from simulated face size and random sharpness.
+    """
+
+    def __init__(self) -> None:
+        logger.info("😐 MockFaceAnalyzer initialised (development mode — no real inference)")
+
+    def analyze(self, image: Image.Image, roi: BoundingBox) -> list[FaceDetection]:
+        import os
+        force_anomaly = os.getenv("MOCK_FORCE_ANOMALY", "0") == "1"
+
+        frame_w, frame_h = image.size
+        frame_area = frame_w * frame_h
+
+        num_faces = random.choices([0, 1, 2], weights=[30, 60, 10], k=1)[0]
+        if force_anomaly:
+            num_faces = max(1, num_faces)
+
+        detections: list[FaceDetection] = []
+        for i in range(num_faces):
+            # Place face box randomly within the desk ROI (min 40×50 px)
+            fx = random.randint(roi.x, max(roi.x, roi.x2 - 80))
+            fy = random.randint(roi.y, max(roi.y, roi.y2 - 80))
+            fw = random.randint(40, min(120, max(41, roi.x2 - fx)))
+            fh = random.randint(50, min(140, max(51, roi.y2 - fy)))
+            face_box  = BoundingBox(x=fx, y=fy, w=fw, h=fh)
+            face_area = fw * fh
+
+            det_conf  = round(random.uniform(0.72, 0.99), 4)
+            sharpness = round(random.uniform(0.30, 0.95), 4)
+
+            if i == 0 and force_anomaly:
+                dominant = EmotionType.ANGRY
+                scores = {e: round(random.uniform(0.02, 0.15), 3) for e in _EMOTION_KEYS}
+                scores[EmotionType.ANGRY]      = round(random.uniform(0.68, 0.95), 3)
+                scores[EmotionType.FRUSTRATED] = round(random.uniform(0.45, 0.70), 3)
+            else:
+                dom_str  = random.choices(_EMOTION_KEYS, weights=_EMOTION_W_LIST, k=1)[0]
+                dominant = EmotionType(dom_str)
+                scores   = {e: round(random.uniform(0.01, 0.20), 3) for e in _EMOTION_KEYS}
+                scores[dom_str] = round(random.uniform(0.45, 0.90), 3)
+
+            clarity = _compute_clarity_score(face_area, sharpness, det_conf, frame_area)
+            overlap = roi.overlap_ratio(face_box)
+
+            detections.append(
+                FaceDetection(
+                    face_id=i,
+                    bounding_box=face_box,
+                    detection_confidence=det_conf,
+                    emotion_scores=scores,
+                    dominant_emotion=dominant,
+                    face_area_px=face_area,
+                    sharpness_score=sharpness,
+                    clarity_score=clarity,
+                    is_inside_roi=overlap >= 0.30,
+                    roi_overlap=round(overlap, 4),
+                )
+            )
+
+        return detections
+
+
+class RealFaceAnalyzer(BaseFaceAnalyzer):
+    """
+    Production face analyzer using DeepFace for emotion recognition.
+
+    Install
+    -------
+        pip install deepface tf-keras opencv-python
+
+    Notes
+    -----
+    - Crops the desk ROI before running DeepFace to speed up detection and
+      reduce false positives from outside the desk zone.
+    - Region coordinates from DeepFace are relative to the ROI crop; they are
+      translated back to full-frame coordinates here.
+    - Emotion scores from DeepFace are in 0–100 range; normalised to 0–1.
+    - Sharpness: normalised Laplacian variance of the cropped face region.
+    - DeepFace "sad" is mapped to FRUSTRATED; "disgust" → DISGUSTED.
+    """
+
+    _EMOTION_MAP: dict[str, EmotionType] = {
+        "angry":    EmotionType.ANGRY,
+        "disgust":  EmotionType.DISGUSTED,
+        "fear":     EmotionType.FEARFUL,
+        "happy":    EmotionType.HAPPY,
+        "sad":      EmotionType.FRUSTRATED,   # "sad" ≈ FRUSTRATED in this context
+        "surprise": EmotionType.SURPRISED,
+        "neutral":  EmotionType.NEUTRAL,
+    }
+
+    def __init__(self) -> None:
+        try:
+            from deepface import DeepFace as _DF  # type: ignore
+            import cv2 as _cv2  # type: ignore  # noqa: F401
+            self._DeepFace = _DF
+            logger.success("✅ RealFaceAnalyzer ready (DeepFace + OpenCV)")
+        except ImportError as exc:
+            raise RuntimeError(
+                "deepface or opencv-python not installed. "
+                "Run: pip install deepface tf-keras opencv-python  "
+                "or set USE_REAL_FACE_MODEL=false in .env to use mock mode."
+            ) from exc
+
+    def analyze(self, image: Image.Image, roi: BoundingBox) -> list[FaceDetection]:
+        import cv2
+        import numpy as np
+
+        roi_crop   = image.crop((roi.x, roi.y, roi.x2, roi.y2))
+        frame_area = image.width * image.height
+
+        try:
+            results = self._DeepFace.analyze(
+                img_path=np.array(roi_crop),
+                actions=["emotion"],
+                enforce_detection=False,
+                silent=True,
+            )
+        except Exception as exc:
+            logger.warning(f"DeepFace analysis failed for roi={roi}: {exc}")
+            return []
+
+        if not isinstance(results, list):
+            results = [results]
+
+        detections: list[FaceDetection] = []
+        for i, result in enumerate(results):
+            reg = result.get("region", {})
+            # Translate ROI-relative coords back to full-frame coords
+            fx = roi.x + int(reg.get("x", 0))
+            fy = roi.y + int(reg.get("y", 0))
+            fw = max(1, int(reg.get("w", 60)))
+            fh = max(1, int(reg.get("h", 80)))
+            face_box  = BoundingBox(x=fx, y=fy, w=fw, h=fh)
+            face_area = fw * fh
+
+            raw_emotions: dict[str, float] = result.get("emotion", {})
+            scores: dict[str, float] = {}
+            for raw_key, raw_score in raw_emotions.items():
+                mapped = self._EMOTION_MAP.get(raw_key.lower())
+                if mapped:
+                    scores[mapped.value] = round(float(raw_score) / 100.0, 4)
+
+            dominant_raw = result.get("dominant_emotion", "neutral").lower()
+            dominant     = self._EMOTION_MAP.get(dominant_raw, EmotionType.NEUTRAL)
+
+            # Sharpness via Laplacian variance of the isolated face crop
+            face_crop = image.crop((fx, fy, fx + fw, fy + fh))
+            gray      = np.array(face_crop.convert("L"))
+            lap_var   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            sharpness = round(min(1.0, lap_var / 500.0), 4)
+
+            det_conf = round(float(result.get("face_confidence", 0.80)), 4)
+            clarity  = _compute_clarity_score(face_area, sharpness, det_conf, frame_area)
+            overlap  = roi.overlap_ratio(face_box)
+
+            detections.append(
+                FaceDetection(
+                    face_id=i,
+                    bounding_box=face_box,
+                    detection_confidence=det_conf,
+                    emotion_scores=scores,
+                    dominant_emotion=dominant,
+                    face_area_px=face_area,
+                    sharpness_score=sharpness,
+                    clarity_score=clarity,
+                    is_inside_roi=overlap >= 0.30,
+                    roi_overlap=round(overlap, 4),
+                )
+            )
+
+        return detections
+
+
+def load_face_analyzer() -> BaseFaceAnalyzer:
+    """
+    Instantiate the appropriate face analyzer from the USE_REAL_FACE_MODEL env var.
+    Called once at application startup alongside load_model().
+
+    USE_REAL_FACE_MODEL=true   → RealFaceAnalyzer (requires deepface + opencv)
+    USE_REAL_FACE_MODEL=false  → MockFaceAnalyzer (default; no extra deps)
+    """
+    import os
+    if os.getenv("USE_REAL_FACE_MODEL", "false").lower() == "true":
+        return RealFaceAnalyzer()
+    return MockFaceAnalyzer()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Best View Selector — picks the clearest face across cameras for a desk
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BestViewSelector:
+    """
+    Selects the highest-quality face view for a desk from multiple cameras.
+
+    Algorithm
+    ---------
+    1. For each camera, find the face with the highest ``clarity_score``
+       that is inside the desk ROI (``is_inside_roi=True``).
+    2. Compare per-camera winners: the camera with the highest winner
+       clarity_score is the **Best View**.
+    3. Compute ``irate_confidence`` = max(ANGRY, FRUSTRATED, DISGUSTED)
+       from the winning face's emotion_scores.
+    4. Set ``is_irate = irate_confidence >= IRATE_EMOTION_THRESHOLD``.
+
+    If no camera detected a face in the ROI, ``no_face_detected=True`` is
+    returned and no alert is generated.
+    """
+
+    def select(
+        self,
+        desk_roi: DeskRoi,
+        candidates: list[tuple[str, list[FaceDetection]]],
+    ) -> BestViewResult:
+        """
+        Args:
+            desk_roi:   The DeskRoi being evaluated (carries desk_id, desk_label,
+                        table_id, and bounding_box).
+            candidates: List of (camera_id, face_detections_for_this_desk).
+                        Faces must already be annotated with is_inside_roi by
+                        BaseFaceAnalyzer.analyze().
+
+        Returns:
+            BestViewResult with winner camera, expression analysis, and irate flag.
+        """
+        best_per_cam:  list[BestViewCandidate] = []
+        best_face:     FaceDetection | None     = None
+        best_camera_id: str                     = ""
+        best_clarity:  float                    = -1.0
+
+        for camera_id, faces in candidates:
+            roi_faces = [f for f in faces if f.is_inside_roi]
+            if not roi_faces:
+                best_per_cam.append(
+                    BestViewCandidate(
+                        camera_id=camera_id,
+                        desk_id=desk_roi.desk_id,
+                        face=None,
+                        clarity_score=0.0,
+                    )
+                )
+                continue
+
+            # Per-camera winner: highest clarity among ROI-inside faces
+            cam_best = max(roi_faces, key=lambda f: f.clarity_score)
+            best_per_cam.append(
+                BestViewCandidate(
+                    camera_id=camera_id,
+                    desk_id=desk_roi.desk_id,
+                    face=cam_best,
+                    clarity_score=cam_best.clarity_score,
+                )
+            )
+            if cam_best.clarity_score > best_clarity:
+                best_clarity   = cam_best.clarity_score
+                best_face      = cam_best
+                best_camera_id = camera_id
+
+        if best_face is None:
+            return BestViewResult(
+                desk_id=desk_roi.desk_id,
+                desk_label=desk_roi.desk_label,
+                table_id=desk_roi.table_id,
+                winner_camera_id=best_camera_id or (candidates[0][0] if candidates else ""),
+                winner_clarity_score=0.0,
+                no_face_detected=True,
+                dominant_emotion=EmotionType.NEUTRAL,
+                emotion_scores={},
+                irate_confidence=0.0,
+                is_irate=False,
+                candidates=best_per_cam,
+            )
+
+        emotion_scores = best_face.emotion_scores
+        irate_conf = max(
+            (emotion_scores.get(e, 0.0) for e in IRATE_EMOTIONS),
+            default=0.0,
+        )
+
+        logger.debug(
+            f"🎭 BestView  desk={desk_roi.desk_id}  "
+            f"winner={best_camera_id}  clarity={best_clarity:.3f}  "
+            f"emotion={best_face.dominant_emotion.value}  "
+            f"irate_conf={irate_conf:.3f}"
+        )
+
+        return BestViewResult(
+            desk_id=desk_roi.desk_id,
+            desk_label=desk_roi.desk_label,
+            table_id=desk_roi.table_id,
+            winner_camera_id=best_camera_id,
+            winner_clarity_score=round(best_clarity, 4),
+            no_face_detected=False,
+            dominant_emotion=best_face.dominant_emotion,
+            emotion_scores=emotion_scores,
+            irate_confidence=round(irate_conf, 4),
+            is_irate=irate_conf >= IRATE_EMOTION_THRESHOLD,
+            candidates=best_per_cam,
+        )

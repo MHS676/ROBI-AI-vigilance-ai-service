@@ -32,9 +32,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from alert_client import classify_anomaly, dispatch_alert, close_http_client
+from alert_client import classify_anomaly, dispatch_alert, dispatch_face_alert, close_http_client
 from config import get_settings
-from inference import decode_frame, filter_detections_by_roi, load_model, BaseYoloModel
+from inference import (
+    decode_frame,
+    filter_detections_by_roi,
+    load_model,
+    BaseYoloModel,
+    BaseFaceAnalyzer,
+    BestViewSelector,
+    load_face_analyzer,
+)
+import cross_camera
 from schemas import (
     AlertSeverity,
     AnomalyType,
@@ -45,6 +54,13 @@ from schemas import (
     AiFeature,
     CLASS_TO_FEATURE,
     Detection,
+    # Cross-camera face analysis
+    CrossCameraLayout,
+    CrossCameraAnalyzeRequest,
+    CrossCameraAnalyzeResponse,
+    FaceDetection,
+    DeskRoi,
+    BestViewResult,
 )
 
 settings = get_settings()
@@ -54,6 +70,9 @@ settings = get_settings()
 # ─────────────────────────────────────────────────────────────────────────────
 
 model: BaseYoloModel | None = None
+
+# Face emotion analyzer singleton — loaded once at startup alongside `model`
+face_analyzer: BaseFaceAnalyzer | None = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-camera AI feature configuration (in-memory)
@@ -74,7 +93,7 @@ _ALL_FEATURES: set[str] = {f.value for f in AiFeature}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load the model at startup; release HTTP client at shutdown."""
-    global model
+    global model, face_analyzer
 
     logger.info("🚀 Falcon AI Service starting up…")
     logger.info(f"   Environment : {settings.app_env}")
@@ -82,8 +101,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"   NestJS URL  : {settings.nestjs_api_url}")
     logger.info(f"   Alert classes: {settings.alert_classes}")
 
-    model = load_model()
-    logger.success("✅ Model ready — service is live")
+    model         = load_model()
+    face_analyzer = load_face_analyzer()
+    logger.success("✅ Model + FaceAnalyzer ready — service is live")
 
     yield  # ← application runs here
 
@@ -378,6 +398,246 @@ async def analyze_frame(
 #         frame_base64=b64, bounding_box=bb,
 #     )
 #     return await analyze_frame(req, background_tasks)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layout management — Cross-Camera ROI Registry
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get(
+    "/layouts",
+    tags=["Cross-Camera"],
+    summary="List all registered cross-camera layouts",
+)
+async def list_layouts() -> dict:
+    return {
+        "layouts": [
+            {
+                "layout_id":         lid,
+                "description":       layout.description,
+                "primary_camera_id": layout.primary_camera_id,
+                "cameras":           [c.camera_id for c in layout.cameras],
+                "desks":             layout.all_desk_ids,
+            }
+            for lid, layout in cross_camera.LAYOUT_REGISTRY.items()
+        ]
+    }
+
+
+@app.get(
+    "/layouts/{layout_id}",
+    response_model=CrossCameraLayout,
+    tags=["Cross-Camera"],
+    summary="Get a registered cross-camera layout by ID",
+)
+async def get_layout(layout_id: str) -> CrossCameraLayout:
+    layout = cross_camera.get_layout(layout_id)
+    if layout is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Layout '{layout_id}' not found. "
+                   f"Available: {list(cross_camera.LAYOUT_REGISTRY.keys())}",
+        )
+    return layout
+
+
+@app.post(
+    "/layouts",
+    response_model=CrossCameraLayout,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Cross-Camera"],
+    summary="Register a new cross-camera layout",
+    description=(
+        "Registers a custom cross-camera layout in memory. "
+        "Layouts are reset on service restart. "
+        "To make a layout permanent, add it to cross_camera.py."
+    ),
+)
+async def register_layout(layout: CrossCameraLayout) -> CrossCameraLayout:
+    cross_camera.register_layout(layout)
+    logger.info(
+        f"✇️  Layout registered  id={layout.layout_id}  "
+        f"cameras={[c.camera_id for c in layout.cameras]}"
+    )
+    return layout
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /analyze-cross-camera — Objective 13: Irate Customer
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/analyze-cross-camera",
+    response_model=CrossCameraAnalyzeResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Cross-Camera"],
+    summary="Objective 13: Irate Customer — Cross-camera face emotion analysis",
+    description="""
+Accepts frames from two or more cameras that share a named cross-camera layout.
+
+**Processing pipeline for each desk in the layout:**
+```
+1.  Decode all incoming frames
+2.  For every camera × every desk ROI:
+      Run BaseFaceAnalyzer.analyze(frame, desk_roi)
+      └──► list[FaceDetection] with emotion scores + clarity metrics
+3.  For every desk:
+      Collect (camera_id, faces) from every camera that provided a frame
+      Run BestViewSelector.select(desk_roi, candidates)
+      └──► Picks the camera with the highest-clarity face in that desk’s ROI
+      └──► Uses that face’s emotion scores for the final Expression Score
+4.  For each desk where is_irate=True:
+      Dispatch BackgroundTask → POST /ingest/ai-alert (NestJS)
+      └──► NestJS broadcasts ‘irate_customer’ WS event to room:super_admin
+         and room:center:{centerId}
+5.  Return CrossCameraAnalyzeResponse with per-desk BestViewResult
+```
+
+**Built-in layout:** `layout_cam1_cam2` — Camera 1 (frontal, 3 desk thirds)
++ Camera 2 (side-angle face view, mirrored desk positions).
+    """,
+)
+async def analyze_cross_camera(
+    request:          CrossCameraAnalyzeRequest,
+    background_tasks: BackgroundTasks,
+) -> CrossCameraAnalyzeResponse:
+    if face_analyzer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="FaceAnalyzer not loaded — service is still starting up",
+        )
+
+    t0          = time.time()
+    server_time = datetime.now(timezone.utc).isoformat()
+
+    # ── 1. Look up layout ─────────────────────────────────────────────────────
+    layout = cross_camera.get_layout(request.layout_id)
+    if layout is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Layout '{request.layout_id}' not registered. "
+                f"Available: {list(cross_camera.LAYOUT_REGISTRY.keys())}"
+            ),
+        )
+
+    logger.info(
+        f"🎥 Cross-camera analysis  center={request.center_id}  "
+        f"layout={request.layout_id}  cameras={[f.camera_id for f in request.frames]}"
+    )
+
+    # ── 2. Decode all frames ───────────────────────────────────────────────
+    from PIL import Image as _PILImage
+    frame_map: dict[str, _PILImage.Image] = {}
+    for frame_input in request.frames:
+        try:
+            img = decode_frame(frame_input.frame_base64, max_size=settings.max_image_size)
+            frame_map[frame_input.camera_id] = img
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Could not decode frame for camera '{frame_input.camera_id}': {exc}",
+            ) from exc
+
+    # ── 3. Run face analysis: for each camera × each desk ROI ─────────────
+    # Structure: face_analyses[camera_id][desk_id] = list[FaceDetection]
+    face_analyses: dict[str, dict[str, list[FaceDetection]]] = {}
+
+    for camera_id, image in frame_map.items():
+        cam_layout = layout.get_camera_layout(camera_id)
+        if cam_layout is None:
+            logger.warning(
+                f"⚠️  Camera '{camera_id}' not in layout '{request.layout_id}' — skipping"
+            )
+            continue
+
+        face_analyses[camera_id] = {}
+        for desk_roi in cam_layout.desk_rois:
+            faces = face_analyzer.analyze(image, desk_roi.bounding_box)
+            face_analyses[camera_id][desk_roi.desk_id] = faces
+            logger.info(
+                f"🎞️  Face analysis  camera={camera_id}  desk={desk_roi.desk_id}  "
+                f"roi={desk_roi.bounding_box}  faces_found={len(faces)}"
+            )
+
+    # ── 4. Cross-camera correlation + Best View Selection per desk ─────────
+    selector: BestViewSelector = BestViewSelector()
+    desk_results: list[BestViewResult] = []
+
+    for desk_id in layout.all_desk_ids:
+        # Canonical DeskRoi definition for this desk (use first camera that has it)
+        desk_roi_def: DeskRoi | None = None
+        for cam in layout.cameras:
+            roi = cam.get_roi_for_desk(desk_id)
+            if roi:
+                desk_roi_def = roi
+                break
+        if desk_roi_def is None:
+            continue
+
+        # Collect (camera_id, faces) for this desk from every camera that
+        # sent a frame.  Cameras that did not send a frame are excluded.
+        candidates: list[tuple[str, list[FaceDetection]]] = [
+            (
+                cam.camera_id,
+                face_analyses.get(cam.camera_id, {}).get(desk_id, []),
+            )
+            for cam in layout.cameras
+            if cam.camera_id in frame_map
+        ]
+
+        result = selector.select(desk_roi_def, candidates)
+        desk_results.append(result)
+
+        if result.is_irate:
+            logger.warning(
+                f"🔴 IRATE_CUSTOMER  center={request.center_id}  "
+                f"desk={desk_id}  table={result.table_id}  "
+                f"winner_cam={result.winner_camera_id}  "
+                f"clarity={result.winner_clarity_score:.3f}  "
+                f"emotion={result.dominant_emotion.value}  "
+                f"irate_conf={result.irate_confidence:.2f}"
+            )
+
+    # ── 5. Dispatch IRATE_CUSTOMER alerts as BackgroundTasks ──────────────
+    irate_dispatched = 0
+    for result in desk_results:
+        if not result.is_irate:
+            continue
+
+        # Capture loop variables in default args to avoid late-binding closure bug
+        async def _dispatch(r: BestViewResult = result, cam: str = result.winner_camera_id):
+            await dispatch_face_alert(
+                center_id=request.center_id,
+                camera_id=cam,
+                table_id=r.table_id,
+                desk_id=r.desk_id,
+                dominant_emotion=r.dominant_emotion.value,
+                irate_confidence=r.irate_confidence,
+            )
+
+        background_tasks.add_task(_dispatch)
+        irate_dispatched += 1
+
+    inference_ms = round((time.time() - t0) * 1000, 2)
+
+    logger.info(
+        f"✅ Cross-camera done  center={request.center_id}  "
+        f"desks={len(desk_results)}  irate={sum(1 for r in desk_results if r.is_irate)}  "
+        f"alerts_queued={irate_dispatched}  total_ms={inference_ms:.1f}"
+    )
+
+    return CrossCameraAnalyzeResponse(
+        center_id=request.center_id,
+        layout_id=request.layout_id,
+        desk_results=desk_results,
+        total_irate_detected=sum(1 for r in desk_results if r.is_irate),
+        irate_alerts_dispatched=irate_dispatched,
+        inference_ms=inference_ms,
+        server_time=server_time,
+    )
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
