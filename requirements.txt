@@ -30,3 +30,14 @@ python-dotenv==1.0.1
 
 # Logging
 loguru==0.7.3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Whisper audio transcription  (POST /transcribe-audio)
+# Also requires ffmpeg on the system:  brew install ffmpeg
+# ─────────────────────────────────────────────────────────────────────────────
+openai-whisper
+# PyTorch CPU-only build (much smaller than the default CUDA build):
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Required for FastAPI UploadFile (multipart/form-data) support
+python-multipart>=0.0.9

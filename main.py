@@ -27,12 +27,19 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 
 from alert_client import classify_anomaly, dispatch_alert, dispatch_face_alert, close_http_client
+from audio import (
+    load_whisper_model,
+    get_whisper_model,
+    transcribe_audio_bytes,
+    SUPPORTED_AUDIO_TYPES,
+    MAX_AUDIO_BYTES,
+)
 from config import get_settings
 from inference import (
     decode_frame,
@@ -638,6 +645,110 @@ async def analyze_cross_camera(
     )
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /transcribe-audio — Whisper speech-to-text
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os as _os
+
+@app.post("/transcribe-audio", tags=["Audio"])
+async def transcribe_audio(
+    file: UploadFile     = File(..., description="Audio file (wav/mp3/m4a/ogg/flac/webm)"),
+    table_id: str        = Form("", description="Table ID that captured this audio (optional)"),
+    language: str        = Form("", description="ISO-639-1 hint e.g. 'en'. Leave blank to auto-detect."),
+) -> JSONResponse:
+    """
+    Transcribe an audio buffer using OpenAI Whisper.
+
+    - **file**: raw audio upload (wav / mp3 / m4a / ogg / flac / webm).
+    - **table_id**: optional — the Table that owns the microphone.
+    - **language**: optional ISO-639-1 code to skip language detection.
+
+    Returns `transcribed_text`, `detected_language`, `confidence_score`,
+    `duration_s`, `inference_ms`, and `model_size`.
+    """
+    # Guard: Whisper loaded?
+    if get_whisper_model() is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Whisper model is not loaded. "
+                "Install openai-whisper and restart the service."
+            ),
+        )
+
+    # Guard: file present?
+    if file is None or not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No audio file provided.",
+        )
+
+    # Guard: content-type / extension
+    content_type = (file.content_type or "").lower().split(";")[0].strip()
+    ext = _os.path.splitext(file.filename or "")[-1].lower()
+    valid_exts = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".mp4"}
+    if content_type not in SUPPORTED_AUDIO_TYPES and ext not in valid_exts:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                f"Unsupported audio format '{content_type or ext}'. "
+                "Accepted: wav, mp3, m4a, ogg, flac, webm."
+            ),
+        )
+
+    # Read body
+    audio_bytes = await file.read()
+
+    if len(audio_bytes) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded audio file is empty.",
+        )
+
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        mb_limit = MAX_AUDIO_BYTES // (1024 * 1024)
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Audio file exceeds the {mb_limit} MB limit.",
+        )
+
+    # Transcribe
+    try:
+        result = await transcribe_audio_bytes(
+            audio_bytes=audio_bytes,
+            filename=file.filename or "upload.wav",
+            language=language.strip() or None,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except Exception as exc:
+        logger.exception(f"Transcription error for table={table_id!r}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Audio transcription failed. Check service logs.",
+        )
+
+    preview = result["transcribed_text"]
+    logger.info(
+        f"Transcription | table={table_id!r} | lang={result['detected_language']} | "
+        f"conf={result['confidence_score']:.2f} | '{preview[:80]}{'...' if len(preview) > 80 else ''}'"
+    )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "table_id":          table_id or None,
+            "transcribed_text":  result["transcribed_text"],
+            "detected_language": result["detected_language"],
+            "confidence_score":  result["confidence_score"],
+            "duration_s":        result["duration_s"],
+            "inference_ms":      result["inference_ms"],
+            "model_size":        result["model_size"],
+        },
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

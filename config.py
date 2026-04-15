@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     max_image_size: int = 1280
     workers: int = 1
 
+    # ── Whisper audio transcription ───────────────────────────────────────────
+    whisper_model_size: str = "base"     # tiny | base | small | medium | large
+    whisper_max_audio_mb: int = 25       # max upload size in megabytes
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
