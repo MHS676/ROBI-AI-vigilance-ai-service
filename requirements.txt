@@ -10,6 +10,9 @@ uvicorn[standard]==0.34.0
 # HTTP client (sends alerts back to the NestJS API)
 httpx==0.28.1
 
+# MQTT client (audio PCM from ESP32-S3 microphones via RabbitMQ MQTT plugin)
+paho-mqtt>=2.0.0
+
 # Image handling
 Pillow==11.1.0
 numpy==2.2.1
