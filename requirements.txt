@@ -1,14 +1,16 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Falcon Security — AI Microservice  (Python 3.11+)
-# Edge Worker: frame analysis, YOLOv8 inference, anomaly alerting
+# Edge Worker: frame analysis, YOLOv8 inference, anomaly alerting,
+#              gate face-recognition attendance
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Web framework
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 
-# HTTP client (sends alerts back to the NestJS API)
-httpx==0.28.1
+# HTTP clients
+httpx==0.28.1                  # sync/async HTTP — used by main inference service
+aiohttp==3.9.5                 # async HTTP — used by gate_attendance.py
 
 # MQTT client (audio PCM from ESP32-S3 microphones via RabbitMQ MQTT plugin)
 paho-mqtt>=2.0.0
@@ -16,10 +18,33 @@ paho-mqtt>=2.0.0
 # Image handling
 Pillow==11.1.0
 numpy==2.2.1
+opencv-python-headless==4.10.0.84  # video capture + frame decode (no GUI deps)
 
 # Data validation (FastAPI uses this natively)
 pydantic==2.10.4
 pydantic-settings==2.7.0
+
+# Environment variable loading
+python-dotenv==1.0.1
+
+# ── Face Recognition (gate_attendance.py) ─────────────────────────────────────
+# DeepFace: high-level face recognition wrapper.
+# Uses PyTorch/CUDA automatically when a GPU is present (RTX 5090).
+deepface==0.0.93
+
+# RetinaFace detector backend (GPU-accelerated face detection)
+retina-face==0.0.17
+
+# TensorFlow is required by DeepFace's VGG-Face / Facenet backends.
+# If using ArcFace with PyTorch backend only, you may pin a lighter build:
+tensorflow==2.16.1             # or tensorflow-gpu for older CUDA setups
+
+# PyTorch — install the CUDA 12.4 wheel for RTX 5090 (Blackwell / sm_120):
+# Replace the line below with the appropriate wheel URL if needed.
+# See: https://pytorch.org/get-started/locally/
+# torch==2.4.0+cu124
+# torchvision==0.19.0+cu124
+# Or simply: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # YOLOv8 inference — ultralytics bundles the model + torchvision
 # Comment this out and use the mock if running without a GPU / large deps
