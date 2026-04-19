@@ -131,13 +131,15 @@ class AlertSeverity(str, Enum):
 
 
 class AnomalyType(str, Enum):
-    WEAPON_DETECTED  = "WEAPON_DETECTED"
-    FIGHT_DETECTED   = "FIGHT_DETECTED"
-    FALL_DETECTED    = "FALL_DETECTED"
-    FIRE_DETECTED    = "FIRE_DETECTED"
+    WEAPON_DETECTED   = "WEAPON_DETECTED"
+    FIGHT_DETECTED    = "FIGHT_DETECTED"
+    FALL_DETECTED     = "FALL_DETECTED"
+    FIRE_DETECTED     = "FIRE_DETECTED"
     UNATTENDED_OBJECT = "UNATTENDED_OBJECT"
-    IRATE_CUSTOMER   = "IRATE_CUSTOMER"   # Objective 13 — cross-camera face emotion
-    UNKNOWN          = "UNKNOWN"
+    IRATE_CUSTOMER    = "IRATE_CUSTOMER"   # Objective 13 — cross-camera face emotion
+    IDLE_AGENT        = "IDLE_AGENT"       # Assigned agent absent > threshold
+    GOSSIP_DETECTED   = "GOSSIP_DETECTED"  # Two+ agents chatting without customer
+    UNKNOWN           = "UNKNOWN"
 
 
 class Detection(BaseModel):
@@ -468,3 +470,107 @@ class CrossCameraAnalyzeResponse(BaseModel):
     irate_alerts_dispatched: int   = Field(default=0, description="Alerts POSTed to NestJS")
     inference_ms:            float = Field(description="Total wall-clock inference time (ms)")
     server_time:             str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent Monitoring — Schemas for /register-table and /monitor-agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TableRegistrationRequest(BaseModel):
+    """
+    POST /register-table
+
+    Called by NestJS on startup (for every provisioned table) and whenever
+    a Super Admin reassigns an agent.
+    """
+    table_id:       str           = Field(..., description="Prisma CUID of the Table")
+    agent_id:       str           = Field(..., description="Prisma CUID of the assigned User")
+    center_id:      str           = Field(..., description="Prisma CUID of the Center")
+    camera_id:      str           = Field(..., description="Prisma CUID of the Camera")
+    face_photo_path: str | None   = Field(
+        None,
+        description=(
+            "Absolute path to the agent's reference face JPEG on the local server, "
+            "e.g. /data/agent-faces/clxyz123.jpg.  "
+            "Matches User.facePhotoPath in the Prisma schema."
+        ),
+    )
+
+
+class TableRegistrationResponse(BaseModel):
+    """Response from POST /register-table."""
+    table_id:        str
+    agent_id:        str
+    embedding_loaded: bool   = Field(description="True if the reference face embedding was loaded successfully")
+    message:         str
+
+
+class AgentMonitorFrameRequest(BaseModel):
+    """
+    POST /monitor-agent
+
+    Sent by the NestJS camera-poller for each table on every polling cycle.
+    Contains the current frame + pre-computed YOLO detection count + table context.
+    """
+    center_id:      str        = Field(..., description="CUID of the center")
+    camera_id:      str        = Field(..., description="CUID of the camera")
+    table_id:       str        = Field(..., description="CUID of the table")
+    agent_id:       str        = Field(..., description="CUID of the assigned agent")
+
+    frame_base64:   str        = Field(
+        ...,
+        description="Base64-encoded JPEG frame from the table's camera (no data URI prefix).",
+    )
+    bounding_box:   BoundingBox = Field(..., description="Table ROI on the camera frame")
+
+    # YOLO-derived person count (already computed upstream by /analyze-frame)
+    persons_in_roi: int        = Field(0, ge=0, description="Number of persons detected in the table ROI by YOLO")
+
+    timestamp: float | None    = Field(None, description="Unix epoch when the frame was captured")
+
+    @field_validator("frame_base64")
+    @classmethod
+    def strip_data_uri(cls, v: str) -> str:
+        if "," in v and v.startswith("data:"):
+            return v.split(",", 1)[1]
+        return v
+
+
+class SHISampleOut(BaseModel):
+    """One timestamped SHI reading in the API response."""
+    ts:      float = Field(description="Monotonic timestamp of this sample")
+    shi:     float = Field(description="Service Happiness Index [0–100]")
+    emotion: str   = Field(description="Dominant emotion at sample time")
+
+
+class AgentMonitorReport(BaseModel):
+    """
+    Response from POST /monitor-agent.
+
+    Summarises all three monitoring results for the current frame.
+    """
+    table_id:   str
+    agent_id:   str
+    server_time: str
+
+    # ── Presence ────────────────────────────────────────────────────────────
+    agent_present:          bool  = False
+    idle_seconds:           float = 0.0
+    idle_alert_triggered:   bool  = False
+
+    # ── Gossip ───────────────────────────────────────────────────────────
+    gossip_active:           bool  = False
+    gossip_duration_seconds: float = 0.0
+    gossip_alert_triggered:  bool  = False
+
+    # ── Service Happiness Index ──────────────────────────────────────────────
+    shi_sampled:    bool              = False
+    latest_shi:     float             = 50.0
+    rolling_shi:    float             = 50.0
+    latest_emotion: str               = "NEUTRAL"
+    shi_history:    list[SHISampleOut] = Field(default_factory=list)
+
+    # ── Activity ───────────────────────────────────────────────────────────
+    active_minutes:       float = 0.0
+    agent_faces_in_roi:   int   = 0
+    unknown_faces_in_roi: int   = 0

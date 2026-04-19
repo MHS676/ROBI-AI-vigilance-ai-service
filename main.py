@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from alert_client import classify_anomaly, dispatch_alert, dispatch_face_alert, close_http_client
+from agent_monitor import agent_monitor
 from audio import (
     load_whisper_model,
     get_whisper_model,
@@ -68,6 +69,12 @@ from schemas import (
     FaceDetection,
     DeskRoi,
     BestViewResult,
+    # Agent monitoring
+    TableRegistrationRequest,
+    TableRegistrationResponse,
+    AgentMonitorFrameRequest,
+    AgentMonitorReport,
+    SHISampleOut,
 )
 
 settings = get_settings()
@@ -111,6 +118,7 @@ async def lifespan(app: FastAPI):
     model         = load_model()
     face_analyzer = load_face_analyzer()
     logger.success("✅ Model + FaceAnalyzer ready — service is live")
+    logger.info(f"🕵️  AgentMonitor ready — {len(agent_monitor.registered_tables)} tables pre-registered")
 
     yield  # ← application runs here
 
@@ -748,6 +756,174 @@ async def transcribe_audio(
             "inference_ms":      result["inference_ms"],
             "model_size":        result["model_size"],
         },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /register-table — Pre-load agent reference embedding
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/register-table",
+    response_model=TableRegistrationResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Agent Monitoring"],
+    summary="Register a table and pre-load the agent's face embedding",
+    description="""
+Called by NestJS on startup (once per provisioned table) and whenever a Super
+Admin reassigns an agent to a table.
+
+Loads the ArcFace reference embedding from `face_photo_path` so that subsequent
+`/monitor-agent` calls can perform fast cosine-distance identity checks without
+re-loading the model.
+""",
+)
+async def register_table(req: TableRegistrationRequest) -> TableRegistrationResponse:
+    loaded = await agent_monitor.register_table(
+        table_id=req.table_id,
+        agent_id=req.agent_id,
+        face_photo_path=req.face_photo_path,
+        center_id=req.center_id,
+        camera_id=req.camera_id,
+    )
+    return TableRegistrationResponse(
+        table_id=req.table_id,
+        agent_id=req.agent_id,
+        embedding_loaded=loaded,
+        message=(
+            "Table registered — reference embedding loaded."
+            if loaded
+            else "Table registered — no face photo supplied (identity check disabled)."
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /monitor-agent/status — snapshot of all registered tables
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get(
+    "/monitor-agent/status",
+    tags=["Agent Monitoring"],
+    summary="Live snapshot of all registered table monitoring states",
+)
+async def agent_monitor_status() -> dict:
+    return {
+        "registered_tables": len(agent_monitor.registered_tables),
+        "tables": agent_monitor.all_snapshots(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /monitor-agent — Per-frame agent monitoring (idle + gossip + SHI)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/monitor-agent",
+    response_model=AgentMonitorReport,
+    status_code=status.HTTP_200_OK,
+    tags=["Agent Monitoring"],
+    summary="Run agent presence, gossip, and SHI checks on one camera frame",
+    description="""
+The primary per-frame agent monitoring endpoint.
+
+**Three checks are performed on every call:**
+
+1. **Agent Presence Verification**
+   Detected faces inside the table ROI are compared (ArcFace cosine distance)
+   against the assigned agent's reference embedding.  If the agent is absent
+   for > `IDLE_THRESHOLD_MINUTES` (default 10 min) during work hours, an
+   `IDLE_AGENT` alert is dispatched to NestJS.
+
+2. **Gossip Detection**
+   If ≥2 known-agent faces are present in the same ROI with no unrecognised
+   customer face for > `GOSSIP_THRESHOLD_SECONDS` (default 300 s), a
+   `GOSSIP_DETECTED` alert is dispatched.
+
+3. **Service Happiness Index (SHI)**
+   The agent's dominant emotion is sampled every 30 s.  Emotion scores are
+   mapped to a weighted score (happy=100 … angry=0) and accumulated into a
+   rolling SHI [0–100].  Metrics are PATCHed to NestJS /ingest/agent-activity
+   for database persistence.
+""",
+)
+async def monitor_agent(
+    req: AgentMonitorFrameRequest,
+    bg: BackgroundTasks,
+) -> AgentMonitorReport:
+    if face_analyzer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Face analyzer not initialised — is the service starting up?",
+        )
+
+    # ── 1. Decode frame ───────────────────────────────────────────────────────
+    frame_pil = decode_frame(req.frame_base64, settings.max_image_size)
+
+    # Convert PIL → numpy BGR for identity cropping (DeepFace uses BGR/numpy)
+    import numpy as np
+    import cv2
+    frame_rgb = np.array(frame_pil)
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+    # ── 2. Run face emotion analysis on the table ROI ─────────────────────────
+    face_detections = face_analyzer.analyze(frame_pil, req.bounding_box)
+
+    # ── 3. Auto-register table if not already known ───────────────────────────
+    if req.table_id not in agent_monitor.registered_tables:
+        logger.warning(
+            f"Table {req.table_id} not pre-registered — auto-registering without face photo. "
+            "Call POST /register-table with face_photo_path to enable identity checks."
+        )
+        await agent_monitor.register_table(
+            table_id=req.table_id,
+            agent_id=req.agent_id,
+            face_photo_path=None,
+            center_id=req.center_id,
+            camera_id=req.camera_id,
+        )
+
+    # ── 4. Run monitoring engine ──────────────────────────────────────────────
+    ts = req.timestamp or time.time()
+    result = await agent_monitor.process_frame(
+        table_id=req.table_id,
+        frame_bgr=frame_bgr,
+        face_detections=face_detections,
+        persons_in_roi=req.persons_in_roi,
+        frame_ts=ts,
+    )
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Table '{req.table_id}' not found in agent monitor.",
+        )
+
+    # ── 5. Build the API response ─────────────────────────────────────────────
+    snapshot = agent_monitor.get_table_snapshot(req.table_id) or {}
+    shi_history = [
+        SHISampleOut(ts=s["ts"], shi=s["shi"], emotion=s["emotion"])
+        for s in snapshot.get("shiSamples", [])
+    ]
+
+    return AgentMonitorReport(
+        table_id=result.table_id,
+        agent_id=result.agent_id,
+        server_time=datetime.now(timezone.utc).isoformat(),
+        agent_present=result.agent_present,
+        idle_seconds=result.idle_seconds,
+        idle_alert_triggered=result.idle_alert_triggered,
+        gossip_active=result.gossip_active,
+        gossip_duration_seconds=result.gossip_duration_seconds,
+        gossip_alert_triggered=result.gossip_alert_triggered,
+        shi_sampled=result.shi_sampled,
+        latest_shi=result.latest_shi,
+        rolling_shi=result.rolling_shi,
+        latest_emotion=result.latest_emotion,
+        shi_history=shi_history,
+        active_minutes=result.active_minutes,
+        agent_faces_in_roi=result.agent_faces_in_roi,
+        unknown_faces_in_roi=result.unknown_faces_in_roi,
     )
 
 
